@@ -64,6 +64,7 @@ def main():
     parser.add_argument('--config', help='Specify a config file to use')
     parser.add_argument('--nolaunch', action='store_true', help='Prevent browser from launching on startup')
     parser.add_argument('--pidfile', help='Create a pid file (only relevant when running as a daemon)')
+    parser.add_argument('--inmemorydb',action='store_true',help='In memory database, data will be lost on shutdown')
     
     args = parser.parse_args()
 
@@ -101,6 +102,8 @@ def main():
     
     # Put the database in the DATA_DIR
     headphones.DB_FILE = os.path.join(headphones.DATA_DIR, 'headphones.db')
+    if args.inmemorydb:
+        headphones.DB_FILE = ":memory:"
     
     headphones.CFG = ConfigObj(headphones.CONFIG_FILE, encoding='utf-8')
     
