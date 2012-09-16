@@ -105,3 +105,56 @@ class DBConnection:
             query = "INSERT INTO "+tableName+" (" + ", ".join(valueDict.keys() + keyDict.keys()) + ")" + \
                         " VALUES (" + ", ".join(["?"] * len(valueDict.keys() + keyDict.keys())) + ")"
             self.action(query, valueDict.values() + keyDict.values())
+
+    def upsertMultiple(self,tableName,valueDicts,keyDicts):
+        if len(valueDicts) != len(keyDicts):
+            raise Exception("Dicts supplied to upsertMultiple need to have the same length")
+        with db_lock:
+            c = self.connection.cursor()
+            try:
+                for i in range(len(valueDicts)):
+                    valueDict = valueDicts[i]
+                    keyDict = keyDicts[i]
+                    changesBefore = self.connection.total_changes
+                    genParams = lambda myDict : [x + " = ?" for x in myDict.keys()]        
+                    query = "UPDATE "+tableName+" SET " + ", ".join(genParams(valueDict)) + " WHERE " + " AND ".join(genParams(keyDict))
+                    sqlResult = None
+                    attempt = 0            
+                    while attempt < 5:
+                        try:
+                            c.execute(query,valueDict.values() + keyDict.values())
+                            break
+                        except sqlite3.OperationalError, e:
+                            if "unable to open database file" in e.message or "database is locked" in e.message:
+                                logger.warn('Database Error: %s' % e)
+                                attempt += 1
+                                time.sleep(1)
+                            else:
+                                logger.error('Database error: %s' % e)
+                                raise
+                        except sqlite3.DatabaseError, e:
+                            logger.error('Fatal Error executing %s :: %s' % (query, e))
+                            raise
+                    if self.connection.total_changes == changesBefore:
+                        query = "INSERT INTO "+tableName+" (" + ", ".join(valueDict.keys() + keyDict.keys()) + ")" + \
+                                    " VALUES (" + ", ".join(["?"] * len(valueDict.keys() + keyDict.keys())) + ")"
+                        sqlResult = None
+                        attempt = 0            
+                        while attempt < 5:
+                            try:
+                                c.execute(query,valueDict.values() + keyDict.values())
+                                break
+                            except sqlite3.OperationalError, e:
+                                if "unable to open database file" in e.message or "database is locked" in e.message:
+                                    logger.warn('Database Error: %s' % e)
+                                    attempt += 1
+                                    time.sleep(1)
+                                else:
+                                    logger.error('Database error: %s' % e)
+                                    raise
+                            except sqlite3.DatabaseError, e:
+                                logger.error('Fatal Error executing %s :: %s' % (query, e))
+                                raise
+            finally:
+                self.connection.commit()
+            

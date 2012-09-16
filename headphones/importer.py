@@ -19,6 +19,7 @@ import os
 from lib.beets.mediafile import MediaFile
 
 import headphones
+from datetime import datetime as dt
 from headphones import logger, helpers, db, mb, albumart, lastfm
 
 various_artists_mbid = '89ad4ac3-39f7-470e-963a-56509c546377'
@@ -156,7 +157,10 @@ def addArtisttoDB(artistid, extrasonly=False):
                     "DateAdded":        helpers.today(),
                     "Status":           "Loading"}
     
+    print "upsertartists"
+    dts = dt.now()
     myDB.upsert("artists", newValueDict, controlValueDict)
+    print (dt.now() - dts).total_seconds()
 
     # See if we need to grab extras. Artist specific extras take precedence over global option
     # Global options are set when adding a new artist
@@ -205,14 +209,18 @@ def addArtisttoDB(artistid, extrasonly=False):
                             "ReleaseCountry":   release['ReleaseCountry'],
                             "ReleaseFormat":    release['ReleaseFormat']
                         }
-
+            print 'upsertalbums'
+            dts = dt.now()
             myDB.upsert("allalbums", newValueDict, controlValueDict)
+            print (dt.now() - dts).total_seconds()
             
             # Build the dictionary for the fullreleaselist
             newValueDict['ReleaseID'] = release['ReleaseID']
             newValueDict['Tracks'] = release['Tracks']
             fullreleaselist.append(newValueDict)
             
+            newValueDicts = []
+            controlValueDicts = []
             for track in release['Tracks']:
 
                 cleanname = helpers.cleanName(artist['artist_name'] + ' ' + rg['title'] + ' ' + track['title'])
@@ -242,9 +250,16 @@ def addArtisttoDB(artistid, extrasonly=False):
                     newValueDict['BitRate'] = match['BitRate']
                     newValueDict['Format'] = match['Format']
                     myDB.action('UPDATE have SET Matched="True" WHERE Location=?', [match['Location']])
-                                
-                myDB.upsert("alltracks", newValueDict, controlValueDict)
-
+                #print 'upserttrack'   
+                #dts = dt.now()
+                newValueDicts.append(newValueDict)
+                controlValueDicts.append(controlValueDict)             
+                #myDB.upsert("alltracks", newValueDict, controlValueDict)
+                #print (dt.now() - dts).total_seconds()
+            print 'upserttrack ' + str(len(newValueDicts))
+            dts = dt.now() 
+            myDB.upsertMultiple("alltracks",newValueDicts,controlValueDicts)
+            print (dt.now() - dts).total_seconds()
         # Basically just do the same thing again for the hybrid release
         # This may end up being called with an empty fullreleaselist
         try:
@@ -267,9 +282,12 @@ def addArtisttoDB(artistid, extrasonly=False):
                         "ReleaseDate":      hybridrelease['ReleaseDate'],
                         "Type":             rg['type']
                     }
-                    
+        print 'upsertalbums2' 
+        dts = dt.now()                   
         myDB.upsert("allalbums", newValueDict, controlValueDict)
-        
+        print (dt.now() - dts).total_seconds()
+        controlValueDicts = []
+        newValueDicts = []
         for track in hybridrelease['Tracks']:
 
             cleanname = helpers.cleanName(artist['artist_name'] + ' ' + rg['title'] + ' ' + track['title'])
@@ -299,9 +317,15 @@ def addArtisttoDB(artistid, extrasonly=False):
                 newValueDict['BitRate'] = match['BitRate']
                 newValueDict['Format'] = match['Format']
                 myDB.action('UPDATE have SET Matched="True" WHERE Location=?', [match['Location']])
-                            
-            myDB.upsert("alltracks", newValueDict, controlValueDict)
-        
+               
+            #dts = dt.now()
+            #controlValueDicts.append(controlValueDict)
+            #newValueDicts.append(newValueDict)
+            #myDB.upsert("alltracks", newValueDict, controlValueDict)
+        dts = dt.now()
+        print 'upserttracks2' + str(len(newValueDicts))       
+        myDB.upsertMultiple("alltracks",newValueDicts,controlValueDicts)
+        print (dt.now() - dts).total_seconds()
         # Delete matched tracks from the have table
         myDB.action('DELETE from have WHERE Matched="True"')
         
@@ -354,7 +378,10 @@ def addArtisttoDB(artistid, extrasonly=False):
             else:
                 newValueDict['Status'] = "Skipped"
         
+        print 'upsertalbums3'
+        dts = dt.now()
         myDB.upsert("albums", newValueDict, controlValueDict)
+        print (dt.now() - dts).total_seconds()
         
         #start a search for the album if it's new and autowant_all is selected:
         # Should this run in a background thread? Don't know if we want to have a bunch of
@@ -368,7 +395,8 @@ def addArtisttoDB(artistid, extrasonly=False):
 
         # This is used to see how many tracks you have from an album - to mark it as downloaded. Default is 80%, can be set in config as ALBUM_COMPLETION_PCT
         total_track_count = len(tracks)
-        
+        newValueDicts = []
+        controlValueDicts = []
         for track in tracks:
         
             controlValueDict = {"TrackID":  track['TrackID'],
@@ -387,9 +415,16 @@ def addArtisttoDB(artistid, extrasonly=False):
                         "Format":           track['Format'],
                         "BitRate":          track['BitRate']
                         }
-                        
-            myDB.upsert("tracks", newValueDict, controlValueDict)
-
+            #print 'upserttracks3'    
+           # dts = dt.now()        
+            #myDB.upsert("tracks", newValueDict, controlValueDict)
+            newValueDicts.append(newValueDict)
+            controlValueDicts.append(controlValueDict)
+            #print (dt.now() - dts).total_seconds()
+        print 'upserttracks3 ' + str(len(newValueDicts))
+        dts = dt.now()
+        myDB.upsertMultiple("tracks",newValueDicts,controlValueDicts)
+        print (dt.now() - dts).total_seconds()    
         # Mark albums as downloaded if they have at least 80% (by default, configurable) of the album
         have_track_count = len(myDB.select('SELECT * from tracks WHERE AlbumID=? AND Location IS NOT NULL', [rg['id']]))
         
@@ -423,8 +458,10 @@ def addArtisttoDB(artistid, extrasonly=False):
                         
     if not errors:
         newValueDict['LastUpdated'] = helpers.now()
-    
+    print 'upsertartists2'
+    dts = dt.now()
     myDB.upsert("artists", newValueDict, controlValueDict)
+    print (dt.now() - dts).total_seconds()
     
     logger.info(u"Seeing if we need album art for: " + artist['artist_name'])
     cache.getThumb(ArtistID=artistid)
