@@ -22,7 +22,87 @@ class DBTests(unittest.TestCase):
         #check that were getting the original data back
         artistList = [column for column in artists[0]]
         self.assertListEqual(artistList,columns)
+    
+    def test_albums_table_upsert(self):
+        myDB = db.DBConnection("test.db")                
+        cvd = {"AlbumID": 'abcdefgh-ijkl-mnop-qrst-uv1234567890'}
 
+        nvd = {"ArtistID":         '12345678-9abc-defg-hijk-lmnopqrstuvw',
+                "ArtistName":       'TestArtistName',
+                "AlbumTitle":       'TestAlbumTitle',
+                "AlbumASIN":        'B12345ABCD',
+                "ReleaseDate":      '2012-10-01',
+                "DateAdded":        '2012-10-17',
+                "Status":           'Skipped',
+                "Type":             'Album',
+                "ArtworkURL":None,
+                "ThumbURL":None,
+                "ReleaseID":        '1234abcd-ijkl-mnop-qrst-uf123456abcd',
+                "ReleaseCountry":   None,
+                "ReleaseFormat":    None,
+                }        
+        #BASIC INSERTION STAGE
+        #insert the album into the empty albums table
+        myDB.upsert('albums',nvd,cvd)
+        #retrieve the album again
+        albums = myDB.select("SELECT * FROM albums")
+        #check that were only inserting a single album
+        self.assertEquals(len(albums),1)
+        album = albums[0]
+        #check the album id
+        self.assertTrue("AlbumID" in album.keys())
+        self.assertTrue(album['AlbumID'] == cvd['AlbumID'])        
+        #check all other keys
+        for key in nvd.keys():
+            self.assertTrue(key in album.keys())
+            self.assertTrue(album[key] == nvd[key])
+
+        #UPDATE STAGE
+        #modify some of the album properties
+        nvd["ArtistName"] = 'DifferentTestArtistName'
+        nvd['AlbumTitle'] = 'DifferentTestAlbumTitle'
+        nvd['Status'] = 'Wanted'
+
+        #update the album in the database
+        myDB.upsert('albums',nvd,cvd)
+        #retrieve it again
+        albums = myDB.select("SELECT * FROM albums")
+        #make sure theres still only one album in the table
+        self.assertEquals(len(albums),1)
+        album = albums[0]
+        #check the album id (should be the same)
+        self.assertTrue("AlbumID" in album.keys())
+        self.assertTrue(album['AlbumID'] == cvd['AlbumID'])        
+        #check all other keys
+        for key in nvd.keys():
+            self.assertTrue(key in album.keys())
+            self.assertTrue(album[key] == nvd[key])
+
+        #INSERTION STAGE 2
+        #modify the album id
+        cvd['AlbumID'] = 'abcdefgh-qrst-ijkl-mnop-uv1234567890'
+        #modify some of the album properties
+        nvd['AlbumTitle'] = "ThirdTestAlbumTitle"
+        nvd['AlbumASIN'] = 'BABCD51234'
+        nvd['Status'] = 'Skipped'
+        #insert the album into the database
+        myDB.upsert('albums',nvd,cvd)
+        #retrieve all albums
+        albums = myDB.select("SELECT * FROM albums")
+        #check that there are two albums in the table now
+        self.assertEquals(len(albums),2)
+        #retrieve only the album we just inserted
+        albums = myDB.select("SELECT * FROM albums WHERE AlbumID=?",[cvd['AlbumID']])
+        #make sure we only got one album
+        self.assertEquals(len(albums),1)
+        album = albums[0]
+        #check the album id
+        self.assertTrue("AlbumID" in album.keys())
+        self.assertTrue(album['AlbumID'] == cvd['AlbumID'])        
+        #check all other keys
+        for key in nvd.keys():
+            self.assertTrue(key in album.keys())
+            self.assertTrue(album[key] == nvd[key])
 
     def list_to_sql(self,list):
         s = ""
