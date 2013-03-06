@@ -188,24 +188,26 @@ class WebInterface(object):
         myDB.action('DELETE from artists WHERE ArtistID=?', [ArtistID])
         myDB.action('DELETE from albums WHERE ArtistID=?', [ArtistID])
         myDB.action('DELETE from tracks WHERE ArtistID=?', [ArtistID])
+        myDB.action('DELETE from allalbums WHERE ArtistID=?', [ArtistID])
+        myDB.action('DELETE from alltracks WHERE ArtistID=?', [ArtistID])
         myDB.action('INSERT OR REPLACE into blacklist VALUES (?)', [ArtistID])
         raise cherrypy.HTTPRedirect("home")
     deleteArtist.exposed = True
     
-
     def deleteEmptyArtists(self):
         logger.info(u"Deleting all empty artists")
         myDB = db.DBConnection()
-        emptyArtistIDs = [row['ArtistID'] for row in myDB.select("SELECT ArtistID FROM artists WHERE HaveTracks == 0")]
+        emptyArtistIDs = [row['ArtistID'] for row in myDB.select("SELECT ArtistID FROM artists WHERE LatestAlbum IS NULL")]
         for ArtistID in emptyArtistIDs:
             logger.info(u"Deleting all traces of artist: " + ArtistID)
             myDB.action('DELETE from artists WHERE ArtistID=?', [ArtistID])
             myDB.action('DELETE from albums WHERE ArtistID=?', [ArtistID])
             myDB.action('DELETE from tracks WHERE ArtistID=?', [ArtistID])
+            myDB.action('DELETE from allalbums WHERE ArtistID=?', [ArtistID])
+            myDB.action('DELETE from alltracks WHERE ArtistID=?', [ArtistID])
             myDB.action('INSERT OR REPLACE into blacklist VALUES (?)', [ArtistID])
     deleteEmptyArtists.exposed = True     
-   
-        
+
     def refreshArtist(self, ArtistID):
         threading.Thread(target=importer.addArtisttoDB, args=[ArtistID]).start()  
         raise cherrypy.HTTPRedirect("artistPage?ArtistID=%s" % ArtistID)
@@ -284,6 +286,15 @@ class WebInterface(object):
         albumswitcher.switch(AlbumID, ReleaseID)
         raise cherrypy.HTTPRedirect("albumPage?AlbumID=%s" % AlbumID)
     switchAlbum.exposed = True
+    
+    def editSearchTerm(self, AlbumID, SearchTerm):
+        logger.info(u"Updating search term for albumid: " + AlbumID)
+        myDB = db.DBConnection()
+        controlValueDict = {'AlbumID': AlbumID}
+        newValueDict = {'SearchTerm': SearchTerm}
+        myDB.upsert("albums", newValueDict, controlValueDict)
+        raise cherrypy.HTTPRedirect("albumPage?AlbumID=%s" % AlbumID)
+    editSearchTerm.exposed = True
 
     def upcoming(self):
         myDB = db.DBConnection()
@@ -293,7 +304,9 @@ class WebInterface(object):
     upcoming.exposed = True
     
     def manage(self):
-        return serve_template(templatename="manage.html", title="Manage")
+        myDB = db.DBConnection()
+        emptyArtists = myDB.select("SELECT * FROM artists WHERE LatestAlbum IS NULL")
+        return serve_template(templatename="manage.html", title="Manage", emptyArtists=emptyArtists)
     manage.exposed = True
     
     def manageArtists(self):
@@ -348,10 +361,14 @@ class WebInterface(object):
         headphones.LASTFM_USERNAME = username
         headphones.config_write()
         threading.Thread(target=lastfm.getArtists).start()
-        time.sleep(10)
         raise cherrypy.HTTPRedirect("home")
     importLastFM.exposed = True
     
+    def importLastFMTag(self, tag, limit):
+        threading.Thread(target=lastfm.getTagTopArtists, args=(tag, limit)).start()
+        raise cherrypy.HTTPRedirect("home")
+    importLastFMTag.exposed = True
+
     def importItunes(self, path):
         headphones.PATH_TO_XML = path
         headphones.config_write()
@@ -360,15 +377,16 @@ class WebInterface(object):
         raise cherrypy.HTTPRedirect("home")
     importItunes.exposed = True
     
-    def musicScan(self, path, redirect=None, autoadd=0):
+    def musicScan(self, path, scan=0, redirect=None, autoadd=0, libraryscan=0):
+        headphones.LIBRARYSCAN = libraryscan
         headphones.ADD_ARTISTS = autoadd
         headphones.MUSIC_DIR = path
-        headphones.config_write()
-        try:    
-            threading.Thread(target=librarysync.libraryScan).start()
-        except Exception, e:
-            logger.error('Unable to complete the scan: %s' % e)
-        time.sleep(10)
+        headphones.config_write() 
+        if scan:
+            try:    
+                threading.Thread(target=librarysync.libraryScan).start()
+            except Exception, e:
+                logger.error('Unable to complete the scan: %s' % e)
         if redirect:
             raise cherrypy.HTTPRedirect(redirect)
         else:
@@ -403,7 +421,6 @@ class WebInterface(object):
         myDB = db.DBConnection()
         history = myDB.select('''SELECT * from snatched order by DateAdded DESC''')
         return serve_template(templatename="history.html", title="History", history=history)
-        return page
     history.exposed = True
     
     def logs(self):
@@ -560,9 +577,9 @@ class WebInterface(object):
                     "use_blackhole" : checked(headphones.BLACKHOLE),
                     "blackhole_dir" : headphones.BLACKHOLE_DIR,
                     "usenet_retention" : headphones.USENET_RETENTION,
-                    "use_nzbmatrix" : checked(headphones.NZBMATRIX),
-                    "nzbmatrix_user" : headphones.NZBMATRIX_USERNAME,
-                    "nzbmatrix_api" : headphones.NZBMATRIX_APIKEY,
+#                    "use_nzbmatrix" : checked(headphones.NZBMATRIX),
+#                    "nzbmatrix_user" : headphones.NZBMATRIX_USERNAME,
+#                    "nzbmatrix_api" : headphones.NZBMATRIX_APIKEY,
                     "use_newznab" : checked(headphones.NEWZNAB),
                     "newznab_host" : headphones.NEWZNAB_HOST,
                     "newznab_api" : headphones.NEWZNAB_APIKEY,
@@ -571,9 +588,16 @@ class WebInterface(object):
                     "use_nzbsorg" : checked(headphones.NZBSORG),
                     "nzbsorg_uid" : headphones.NZBSORG_UID,
                     "nzbsorg_hash" : headphones.NZBSORG_HASH,
-                    "use_newzbin" : checked(headphones.NEWZBIN),
-                    "newzbin_uid" : headphones.NEWZBIN_UID,
-                    "newzbin_pass" : headphones.NEWZBIN_PASSWORD,
+#                    "use_newzbin" : checked(headphones.NEWZBIN),
+#                    "newzbin_uid" : headphones.NEWZBIN_UID,
+#                    "newzbin_pass" : headphones.NEWZBIN_PASSWORD,
+                    "use_nzbsrus" : checked(headphones.NZBSRUS),
+                    "nzbsrus_uid" : headphones.NZBSRUS_UID,
+                    "nzbsrus_apikey" : headphones.NZBSRUS_APIKEY,
+                    "use_nzbx" : checked(headphones.NZBX),
+                    "preferred_words" : headphones.PREFERRED_WORDS,
+                    "ignored_words" : headphones.IGNORED_WORDS,
+                    "required_words" : headphones.REQUIRED_WORDS,
                     "torrentblackhole_dir" : headphones.TORRENTBLACKHOLE_DIR,
                     "download_torrent_dir" : headphones.DOWNLOAD_TORRENT_DIR,
                     "numberofseeders" : headphones.NUMBEROFSEEDERS,
@@ -596,12 +620,14 @@ class WebInterface(object):
                     "pref_bitrate" : headphones.PREFERRED_BITRATE,
                     "pref_bitrate_high" : headphones.PREFERRED_BITRATE_HIGH_BUFFER,
                     "pref_bitrate_low" : headphones.PREFERRED_BITRATE_LOW_BUFFER,
+                    "pref_bitrate_allow_lossless" : checked(headphones.PREFERRED_BITRATE_ALLOW_LOSSLESS),
                     "detect_bitrate" : checked(headphones.DETECT_BITRATE),
                     "move_files" : checked(headphones.MOVE_FILES),
                     "rename_files" : checked(headphones.RENAME_FILES),
                     "correct_metadata" : checked(headphones.CORRECT_METADATA),
                     "cleanup_files" : checked(headphones.CLEANUP_FILES),
                     "add_album_art" : checked(headphones.ADD_ALBUM_ART),
+                    "album_art_format" : headphones.ALBUM_ART_FORMAT,
                     "embed_album_art" : checked(headphones.EMBED_ALBUM_ART),
                     "embed_lyrics" : checked(headphones.EMBED_LYRICS),
                     "dest_dir" : headphones.DESTINATION_DIR,
@@ -611,13 +637,15 @@ class WebInterface(object):
                     "include_extras" : checked(headphones.INCLUDE_EXTRAS),
                     "autowant_upcoming" : checked(headphones.AUTOWANT_UPCOMING),
                     "autowant_all" : checked(headphones.AUTOWANT_ALL),
+                    "keep_torrent_files" : checked(headphones.KEEP_TORRENT_FILES),
                     "log_dir" : headphones.LOG_DIR,
                     "cache_dir" : headphones.CACHE_DIR,
                     "interface_list" : interface_list,
                     "music_encoder":        checked(headphones.MUSIC_ENCODER),
                     "encoder":      headphones.ENCODER,
+                    "xldprofile":   headphones.XLDPROFILE,
                     "bitrate":      int(headphones.BITRATE),
-                    "encoderfolder":    headphones.ENCODERFOLDER,
+                    "encoderfolder":    headphones.ENCODER_PATH,
                     "advancedencoder":  headphones.ADVANCEDENCODER,
                     "encoderoutputformat": headphones.ENCODEROUTPUTFORMAT,
                     "samplingfrequency": headphones.SAMPLINGFREQUENCY,
@@ -640,6 +668,10 @@ class WebInterface(object):
                     "nma_priority": int(headphones.NMA_PRIORITY),
                     "nma_onsnatch": checked(headphones.NMA_ONSNATCH),
                     "synoindex_enabled": checked(headphones.SYNOINDEX_ENABLED),
+                    "pushover_enabled": checked(headphones.PUSHOVER_ENABLED),
+                    "pushover_onsnatch": checked(headphones.PUSHOVER_ONSNATCH),
+                    "pushover_keys": headphones.PUSHOVER_KEYS,
+                    "pushover_priority": headphones.PUSHOVER_PRIORITY,
                     "mirror_list": headphones.MIRRORLIST,
                     "mirror": headphones.MIRROR,
                     "customhost": headphones.CUSTOMHOST,
@@ -670,17 +702,18 @@ class WebInterface(object):
 
     def configUpdate(self, http_host='0.0.0.0', http_username=None, http_port=8181, http_password=None, launch_browser=0, api_enabled=0, api_key=None, 
         download_scan_interval=None, nzb_search_interval=None, libraryscan_interval=None, sab_host=None, sab_username=None, sab_apikey=None, sab_password=None, 
-        sab_category=None, download_dir=None, blackhole=0, blackhole_dir=None, usenet_retention=None, nzbmatrix=0, nzbmatrix_username=None, nzbmatrix_apikey=None, 
-        newznab=0, newznab_host=None, newznab_apikey=None, newznab_enabled=0, nzbsorg=0, nzbsorg_uid=None, nzbsorg_hash=None, newzbin=0, newzbin_uid=None, 
-        newzbin_password=None, preferred_quality=0, preferred_bitrate=None, detect_bitrate=0, move_files=0, torrentblackhole_dir=None, download_torrent_dir=None, 
+        sab_category=None, download_dir=None, blackhole=0, blackhole_dir=None, usenet_retention=None, newznab=0, newznab_host=None, newznab_apikey=None, 
+        newznab_enabled=0, nzbsorg=0, nzbsorg_uid=None, nzbsorg_hash=None, nzbsrus=0, nzbsrus_uid=None, nzbsrus_apikey=None, nzbx=0, preferred_words=None, required_words=None, ignored_words=None,
+        preferred_quality=0, preferred_bitrate=None, detect_bitrate=0, move_files=0, torrentblackhole_dir=None, download_torrent_dir=None, 
         numberofseeders=10, use_isohunt=0, use_kat=0, use_mininova=0, waffles=0, waffles_uid=None, waffles_passkey=None, whatcd=0, whatcd_username=None, whatcd_password=None,
-        rutracker=0, rutracker_user=None, rutracker_password=None, rename_files=0, correct_metadata=0, cleanup_files=0, add_album_art=0, embed_album_art=0, embed_lyrics=0, 
+        rutracker=0, rutracker_user=None, rutracker_password=None, rename_files=0, correct_metadata=0, cleanup_files=0, add_album_art=0, album_art_format=None, embed_album_art=0, embed_lyrics=0, 
         destination_dir=None, lossless_destination_dir=None, folder_format=None, file_format=None, include_extras=0, single=0, ep=0, compilation=0, soundtrack=0, live=0,
-        remix=0, spokenword=0, audiobook=0, autowant_upcoming=False, autowant_all=False, interface=None, log_dir=None, cache_dir=None, music_encoder=0, encoder=None, bitrate=None, 
-        samplingfrequency=None, encoderfolder=None, advancedencoder=None, encoderoutputformat=None, encodervbrcbr=None, encoderquality=None, encoderlossless=0, 
+        remix=0, spokenword=0, audiobook=0, autowant_upcoming=False, autowant_all=False, keep_torrent_files=False, interface=None, log_dir=None, cache_dir=None, music_encoder=0, encoder=None, xldprofile=None,
+        bitrate=None, samplingfrequency=None, encoderfolder=None, advancedencoder=None, encoderoutputformat=None, encodervbrcbr=None, encoderquality=None, encoderlossless=0, 
         delete_lossless_files=0, prowl_enabled=0, prowl_onsnatch=0, prowl_keys=None, prowl_priority=0, xbmc_enabled=0, xbmc_host=None, xbmc_username=None, xbmc_password=None, 
-        xbmc_update=0, xbmc_notify=0, nma_enabled=False, nma_apikey=None, nma_priority=0, nma_onsnatch=0, synoindex_enabled=False, mirror=None, customhost=None, customport=None, 
-        customsleep=None, hpuser=None, hppass=None, preferred_bitrate_high_buffer=None, preferred_bitrate_low_buffer=None, cache_sizemb=0, **kwargs):
+        xbmc_update=0, xbmc_notify=0, nma_enabled=False, nma_apikey=None, nma_priority=0, nma_onsnatch=0, synoindex_enabled=False, 
+        pushover_enabled=0, pushover_onsnatch=0, pushover_keys=None, pushover_priority=0, mirror=None, customhost=None, customport=None, 
+        customsleep=None, hpuser=None, hppass=None, preferred_bitrate_high_buffer=None, preferred_bitrate_low_buffer=None, preferred_bitrate_allow_lossless=0, cache_sizemb=None, **kwargs):
 
         headphones.HTTP_HOST = http_host
         headphones.HTTP_PORT = http_port
@@ -701,9 +734,9 @@ class WebInterface(object):
         headphones.BLACKHOLE = blackhole
         headphones.BLACKHOLE_DIR = blackhole_dir
         headphones.USENET_RETENTION = usenet_retention
-        headphones.NZBMATRIX = nzbmatrix
-        headphones.NZBMATRIX_USERNAME = nzbmatrix_username
-        headphones.NZBMATRIX_APIKEY = nzbmatrix_apikey
+#        headphones.NZBMATRIX = nzbmatrix
+#        headphones.NZBMATRIX_USERNAME = nzbmatrix_username
+#        headphones.NZBMATRIX_APIKEY = nzbmatrix_apikey
         headphones.NEWZNAB = newznab
         headphones.NEWZNAB_HOST = newznab_host
         headphones.NEWZNAB_APIKEY = newznab_apikey
@@ -711,9 +744,16 @@ class WebInterface(object):
         headphones.NZBSORG = nzbsorg
         headphones.NZBSORG_UID = nzbsorg_uid
         headphones.NZBSORG_HASH = nzbsorg_hash
-        headphones.NEWZBIN = newzbin
-        headphones.NEWZBIN_UID = newzbin_uid
-        headphones.NEWZBIN_PASSWORD = newzbin_password
+#        headphones.NEWZBIN = newzbin
+#        headphones.NEWZBIN_UID = newzbin_uid
+#        headphones.NEWZBIN_PASSWORD = newzbin_password
+        headphones.NZBSRUS = nzbsrus
+        headphones.NZBSRUS_UID = nzbsrus_uid
+        headphones.NZBSRUS_APIKEY = nzbsrus_apikey
+        headphones.NZBX = nzbx
+        headphones.PREFERRED_WORDS = preferred_words
+        headphones.IGNORED_WORDS = ignored_words
+        headphones.REQUIRED_WORDS = required_words
         headphones.TORRENTBLACKHOLE_DIR = torrentblackhole_dir
         headphones.NUMBEROFSEEDERS = numberofseeders
         headphones.DOWNLOAD_TORRENT_DIR = download_torrent_dir
@@ -733,12 +773,14 @@ class WebInterface(object):
         headphones.PREFERRED_BITRATE = preferred_bitrate
         headphones.PREFERRED_BITRATE_HIGH_BUFFER = preferred_bitrate_high_buffer
         headphones.PREFERRED_BITRATE_LOW_BUFFER = preferred_bitrate_low_buffer
+        headphones.PREFERRED_BITRATE_ALLOW_LOSSLESS = preferred_bitrate_allow_lossless
         headphones.DETECT_BITRATE = detect_bitrate
         headphones.MOVE_FILES = move_files
         headphones.CORRECT_METADATA = correct_metadata
         headphones.RENAME_FILES = rename_files
         headphones.CLEANUP_FILES = cleanup_files
         headphones.ADD_ALBUM_ART = add_album_art
+        headphones.ALBUM_ART_FORMAT = album_art_format
         headphones.EMBED_ALBUM_ART = embed_album_art
         headphones.EMBED_LYRICS = embed_lyrics
         headphones.DESTINATION_DIR = destination_dir
@@ -748,14 +790,16 @@ class WebInterface(object):
         headphones.INCLUDE_EXTRAS = include_extras
         headphones.AUTOWANT_UPCOMING = autowant_upcoming
         headphones.AUTOWANT_ALL = autowant_all
+        headphones.KEEP_TORRENT_FILES = keep_torrent_files
         headphones.INTERFACE = interface
         headphones.LOG_DIR = log_dir
         headphones.CACHE_DIR = cache_dir
         headphones.MUSIC_ENCODER = music_encoder
         headphones.ENCODER = encoder
+        headphones.XLDPROFILE = xldprofile
         headphones.BITRATE = int(bitrate)
         headphones.SAMPLINGFREQUENCY = int(samplingfrequency)
-        headphones.ENCODERFOLDER = encoderfolder
+        headphones.ENCODER_PATH = encoderfolder
         headphones.ADVANCEDENCODER = advancedencoder
         headphones.ENCODEROUTPUTFORMAT = encoderoutputformat
         headphones.ENCODERVBRCBR = encodervbrcbr
@@ -777,6 +821,10 @@ class WebInterface(object):
         headphones.NMA_PRIORITY = nma_priority
         headphones.NMA_ONSNATCH = nma_onsnatch
         headphones.SYNOINDEX_ENABLED = synoindex_enabled
+        headphones.PUSHOVER_ENABLED = pushover_enabled
+        headphones.PUSHOVER_ONSNATCH = pushover_onsnatch
+        headphones.PUSHOVER_KEYS = pushover_keys
+        headphones.PUSHOVER_PRIORITY = pushover_priority
         headphones.MIRROR = mirror
         headphones.CUSTOMHOST = customhost
         headphones.CUSTOMPORT = customport
@@ -812,6 +860,11 @@ class WebInterface(object):
             i+=1
         
         headphones.EXTRAS = ','.join(str(n) for n in temp_extras_list)    
+        
+        # Sanity checking
+        if headphones.SEARCH_INTERVAL < 360:
+            logger.info("Search interval too low. Resetting to 6 hour minimum")
+            headphones.SEARCH_INTERVAL = 360
         
         # Write the config
         headphones.config_write()

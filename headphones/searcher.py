@@ -13,7 +13,7 @@
 #  You should have received a copy of the GNU General Public License
 #  along with Headphones.  If not, see <http://www.gnu.org/licenses/>.
 
-import urllib, urllib2, urlparse
+import urllib, urllib2, urlparse, httplib
 import lib.feedparser as feedparser
 from lib.pygazelle import api as gazelleapi
 from lib.pygazelle import encoding as gazelleencoding
@@ -21,6 +21,7 @@ from lib.pygazelle import format as gazelleformat
 from lib.pygazelle import media as gazellemedia
 from xml.dom import minidom
 from xml.parsers.expat import ExpatError
+import lib.simplejson as json
 from StringIO import StringIO
 import gzip
 
@@ -84,7 +85,17 @@ def url_fix(s, charset='utf-8'):
     scheme, netloc, path, qs, anchor = urlparse.urlsplit(s)
     path = urllib.quote(path, '/%')
     qs = urllib.quote_plus(qs, ':&=')
-    return urlparse.urlunsplit((scheme, netloc, path, qs, anchor))    
+    return urlparse.urlunsplit((scheme, netloc, path, qs, anchor))
+    
+def patch_http_response_read(func):
+    def inner(*args):
+        try:
+            return func(*args)
+        except httplib.IncompleteRead, e:
+            return e.partial
+
+    return inner
+httplib.HTTPResponse.read = patch_http_response_read(httplib.HTTPResponse.read)
     
     
 def searchforalbum(albumid=None, new=False, lossless=False):
@@ -98,7 +109,7 @@ def searchforalbum(albumid=None, new=False, lossless=False):
          
         for result in results:
             foundNZB = "none"
-            if (headphones.NZBMATRIX or headphones.NEWZNAB or headphones.NZBSORG or headphones.NEWZBIN) and (headphones.SAB_HOST or headphones.BLACKHOLE):
+            if (headphones.NEWZNAB or headphones.NZBSORG or headphones.NZBX or headphones.NZBSRUS) and (headphones.SAB_HOST or headphones.BLACKHOLE):
                 if result['Status'] == "Wanted Lossless":
                     foundNZB = searchNZB(result['AlbumID'], new, losslessOnly=True)
                 else:
@@ -125,9 +136,9 @@ def searchNZB(albumid=None, new=False, losslessOnly=False):
     myDB = db.DBConnection()
     
     if albumid:
-        results = myDB.select('SELECT ArtistName, AlbumTitle, AlbumID, ReleaseDate, Type from albums WHERE AlbumID=?', [albumid])
+        results = myDB.select('SELECT ArtistName, AlbumTitle, AlbumID, ReleaseDate, Type, SearchTerm from albums WHERE AlbumID=?', [albumid])
     else:
-        results = myDB.select('SELECT ArtistName, AlbumTitle, AlbumID, ReleaseDate, Type from albums WHERE Status="Wanted" OR Status="Wanted Lossless"')
+        results = myDB.select('SELECT ArtistName, AlbumTitle, AlbumID, ReleaseDate, Type, SearchTerm from albums WHERE Status="Wanted" OR Status="Wanted Lossless"')
         new = True
         
     for albums in results:
@@ -142,86 +153,32 @@ def searchNZB(albumid=None, new=False, losslessOnly=False):
         
         dic = {'...':'', ' & ':' ', ' = ': ' ', '?':'', '$':'s', ' + ':' ', '"':'', ',':'', '*':'', '.':'', ':':''}
 
-        cleanalbum = helpers.latinToAscii(helpers.replace_all(albums[1], dic))
-        cleanartist = helpers.latinToAscii(helpers.replace_all(albums[0], dic))
-
-        # FLAC usually doesn't have a year for some reason so I'll leave it out
-        # Various Artist albums might be listed as VA, so I'll leave that out too
-        # Only use the year if the term could return a bunch of different albums, i.e. self-titled albums
-        if albums[0] in albums[1] or len(albums[0]) < 4 or len(albums[1]) < 4:
-            term = cleanartist + ' ' + cleanalbum + ' ' + year
-        elif albums[0] == 'Various Artists':
-            term = cleanalbum + ' ' + year
+        cleanalbum = helpers.latinToAscii(helpers.replace_all(albums[1], dic)).strip()
+        cleanartist = helpers.latinToAscii(helpers.replace_all(albums[0], dic)).strip()
+        
+        # Use the provided search term if available, otherwise build a search term
+        if albums[5]:
+            term = albums[5]
+        
         else:
-            term = cleanartist + ' ' + cleanalbum
+            # FLAC usually doesn't have a year for some reason so I'll leave it out
+            # Various Artist albums might be listed as VA, so I'll leave that out too
+            # Only use the year if the term could return a bunch of different albums, i.e. self-titled albums
+            if albums[0] in albums[1] or len(albums[0]) < 4 or len(albums[1]) < 4:
+                term = cleanartist + ' ' + cleanalbum + ' ' + year
+            elif albums[0] == 'Various Artists':
+                term = cleanalbum + ' ' + year
+            else:
+                term = cleanartist + ' ' + cleanalbum
             
         # Replace bad characters in the term and unicode it
         term = re.sub('[\.\-\/]', ' ', term).encode('utf-8')
+        
         artistterm = re.sub('[\.\-\/]', ' ', cleanartist).encode('utf-8')
         
         logger.info("Searching for %s since it was marked as wanted" % term)
         
         resultlist = []
-        
-        if headphones.NZBMATRIX:
-            provider = "nzbmatrix"
-            if headphones.PREFERRED_QUALITY == 3 or losslessOnly:
-                categories = "23" 
-            elif headphones.PREFERRED_QUALITY:
-                categories = "23,22"
-            else:
-                categories = "22"
-                
-            # Search Audiobooks/Singles/etc
-            if albums['Type'] == "Other":
-                categories = "49"
-                logger.info("Album type is audiobook/spokenword. Using audiobook category")
-            if albums['Type'] == "Single":
-                categories = "47"
-                logger.info("Album type is 'Single'. Using singles category")
-                
-            # For some reason NZBMatrix is erroring out/timing out when the term starts with a "The" right now
-            # so we'll strip it out for the time being. This may get fixed on their end, it may not, but
-            # hopefully this will fix it for now. If you notice anything else it gets stuck on, please post it
-            # on Github so it can be added
-            if term.lower().startswith("the "):
-                term = term[4:]
-            
-            
-            params = {    "page": "download",
-                        "username": headphones.NZBMATRIX_USERNAME,
-                        "apikey": headphones.NZBMATRIX_APIKEY,
-                        "subcat": categories,
-                        "maxage": headphones.USENET_RETENTION,
-                        "english": 1,
-                        "ssl": 1,
-                        "scenename": 1,
-                        "term": term
-                        }
-                        
-            searchURL = "http://rss.nzbmatrix.com/rss.php?" + urllib.urlencode(params)
-            logger.info(u'Parsing results from <a href="%s">NZBMatrix</a>' % searchURL)
-            try:
-                data = urllib2.urlopen(searchURL, timeout=20).read()
-            except urllib2.URLError, e:
-                logger.warn('Error fetching data from NZBMatrix: %s' % e)
-                data = False   
-                
-            if data:
-            
-                d = feedparser.parse(data)
-                
-                for item in d.entries:
-                    try:
-                        url = item.link
-                        title = item.title
-                        size = int(item.links[1]['length'])
-                        
-                        resultlist.append((title, size, url, provider))
-                        logger.info('Found %s. Size: %s' % (title, helpers.bytes_to_mb(size)))
-                    
-                    except AttributeError, e:
-                        logger.info(u"No results found from NZBMatrix for %s" % term)
             
         if headphones.NEWZNAB:
             
@@ -244,6 +201,17 @@ def searchNZB(albumid=None, new=False, losslessOnly=False):
                 logger.info("Album type is audiobook/spokenword. Using audiobook category")
                 
             for newznab_host in newznab_hosts:
+                
+                # Add a little mod for kere.ws
+                if newznab_host[0] == "http://kere.ws":
+                    if categories == "3040":
+                        categories = categories + ",4070"
+                    elif categories == "3040,3010":
+                        categories = categories + ",4070,4010"
+                    elif categories == "3010":
+                        categories = categories + ",4010"
+                    else:
+                        categories = categories + ",4050"
 
                 params = {    "t": "search",
                             "apikey": newznab_host[1],
@@ -253,12 +221,17 @@ def searchNZB(albumid=None, new=False, losslessOnly=False):
                             }
             
                 searchURL = newznab_host[0] + '/api?' + urllib.urlencode(params)
-                    
+                
+                # Add a user-agent
+                request = urllib2.Request(searchURL)
+                request.add_header('User-Agent', 'headphones/0.0 +https://github.com/rembo10/headphones')
+                opener = urllib2.build_opener()
+                
                 logger.info(u'Parsing results from <a href="%s">%s</a>' % (searchURL, newznab_host[0]))
                 
                 try:
-                    data = urllib2.urlopen(searchURL, timeout=20).read()
-                except urllib2.URLError, e:
+                    data = opener.open(request).read()
+                except Exception, e:
                     logger.warn('Error fetching data from %s: %s' % (newznab_host[0], e))
                     data = False
                     
@@ -333,96 +306,137 @@ def searchNZB(albumid=None, new=False, losslessOnly=False):
                             
                         except Exception, e:
                             logger.error(u"An unknown error occurred trying to parse the feed: %s" % e)
-
-        if headphones.NEWZBIN:
-            provider = "newzbin"    
-            providerurl = "https://www.newzbin2.es/"
+                            
+        if headphones.NZBSRUS:
+            
+            provider = "nzbsrus"
+            categories = "54"
+            
             if headphones.PREFERRED_QUALITY == 3 or losslessOnly:
-                categories = "7"        #music
-                format = "2"             #flac
+                sub = "16"
             elif headphones.PREFERRED_QUALITY:
-                categories = "7"        #music
-                format = "10"            #mp3+flac
+                sub = ""
             else:
-                categories = "7"        #music
-                format = "8"            #mp3      
-
+                sub = "15"
+                
             if albums['Type'] == 'Other':
-                categories = "13"
-                format = "16"
-                logger.info("Album type is audiobook/spokenword. Using audiobook category")
-            
-            params = {   
-                        "fpn": "p",
-                        'u_nfo_posts_only': 0,
-                        'u_url_posts_only': 0,
-                        'u_comment_posts_only': 0,
-                        'u_show_passworded': 0,
-                        "searchaction": "Search",
-                        #"dl": 1,
-                        "category": categories,
-                        "retention": headphones.USENET_RETENTION,
-                        "ps_rb_audio_format": format,
-                        "feed": "rss",
-                        "u_post_results_amt": 50,        #this can default to a high number per user
-                        "hauth": 1,
-                        "q": term
-                      }
-            searchURL = providerurl + "search/?%s" % urllib.urlencode(params)
-            try:
-                data = getNewzbinURL(searchURL)
-            except exceptions.NewzbinAPIThrottled:
-                #try again if we were throttled
-                data = getNewzbinURL(searchURL)
-            if data:
-                logger.info(u'Parsing results from <a href="%s">%s</a>' % (searchURL, providerurl))
-                
-                try:    
-                    d = minidom.parseString(data)
-                    node = d.documentElement
-                    items = d.getElementsByTagName("item")
-                except ExpatError:
-                    logger.info('Unable to get the NEWZBIN feed. Check that your settings are correct - post a bug if they are')
-                    items = []
-            
-            if len(items):
-            
-                for item in items:
-        
-                    sizenode = item.getElementsByTagName("report:size")[0].childNodes
-                    titlenode = item.getElementsByTagName("title")[0].childNodes
-                    linknode = item.getElementsByTagName("link")[0].childNodes
-    
-                    for node in sizenode:
-                        size = int(node.data)
-                    for node in titlenode:
-                        title = node.data
-                    for node in linknode:
-                        url = node.data
-                        
-                        #exract the reportid from the link nodes
-                        id_regex = re.escape(providerurl) + 'browse/post/(\d+)/'
-                        id_match = re.match(id_regex, url)
-                        if not id_match:
-                            logger.info("Didn't find a valid Newzbin reportid in linknode")
-                        else:
-                            url = id_match.group(1) #we have to make a post request later, need the id                            
-                    if url:
-                        resultlist.append((title, size, url, provider))
-                        logger.info('Found %s. Size: %s' % (title, helpers.bytes_to_mb(size)))
-                    else:
-                        logger.info('No url link found in nzb. Skipping.')    
-                
-            else:
-                logger.info('No results found from NEWZBIN for %s' % term)
+                sub = ""
+                logger.info("Album type is audiobook/spokenword. Searching all music categories")
 
-        #attempt to verify that this isn't a substring result
-        #when looking for "Foo - Foo" we don't want "Foobar"
-        #this should be less of an issue when it isn't a self-titled album so we'll only check vs artist
+            params = {  "uid": headphones.NZBSRUS_UID,
+                        "key": headphones.NZBSRUS_APIKEY,
+                        "cat": categories,
+                        "sub": sub,
+                        "age": headphones.USENET_RETENTION,
+                        "searchtext": term
+                        }
+        
+            searchURL = 'https://www.nzbsrus.com/api.php?' + urllib.urlencode(params)
+            
+            # Add a user-agent
+            request = urllib2.Request(searchURL)
+            request.add_header('User-Agent', 'headphones/0.0 +https://github.com/rembo10/headphones')
+            opener = urllib2.build_opener()
+            
+            logger.info(u'Parsing results from <a href="%s">NZBsRus</a>' % searchURL)
+            
+            try:
+                data = opener.open(request).read()
+            except Exception, e:
+                logger.warn('Error fetching data from NZBsRus: %s' % e)
+                data = False
+                
+            if data:
+            
+                d = feedparser.parse(data)
+                
+                if not len(d.entries):
+                    logger.info(u"No results found from NZBsRus for %s" % term)
+                    pass
+                
+                else:
+                    for item in d.entries:
+                        try:
+                            url = item.link
+                            title = item.title
+                            size = int(item.links[1]['length'])
+                            
+                            resultlist.append((title, size, url, provider))
+                            logger.info('Found %s. Size: %s' % (title, helpers.bytes_to_mb(size))) 
+                        
+                        except Exception, e:
+                            logger.error(u"An unknown error occurred trying to parse the feed: %s" % e)
+                            
+        if headphones.NZBX:
+            provider = "nzbx"
+            if headphones.PREFERRED_QUALITY == 3 or losslessOnly:
+                categories = "3040"
+            elif headphones.PREFERRED_QUALITY:
+                categories = "3040,3010"
+            else:
+                categories = "3010"
+                
+            if albums['Type'] == 'Other':
+                categories = "3030"
+                logger.info("Album type is audiobook/spokenword. Using audiobook category")
+
+            params = {  "source" : "headphones",
+                        "cat": categories,
+                        "q": term
+                        }
+        
+            searchURL = 'https://nzbx.co/api/search?' + urllib.urlencode(params)
+                
+            logger.info(u'Parsing results from <a href="%s">nzbx.co</a>' % searchURL)
+            
+            try:
+                data = urllib2.urlopen(searchURL, timeout=20).read()
+            except urllib2.URLError, e:
+                logger.warn('Error fetching data from nzbx.co: %s' % str(e))
+                data = False
+                
+            if data:
+                
+                d = json.loads(data)
+                
+                if not len(d):
+                    logger.info(u"No results found from nzbx.co for %s" % term)
+                    pass
+                
+                else:
+                    for item in d:
+                        try:
+                            url = item['nzb']
+                            title = item['name']
+                            size = item['size']
+                            
+                            resultlist.append((title, size, url, provider))
+                            logger.info('Found %s. Size: %s' % (title, helpers.bytes_to_mb(size)))
+                            
+                        except Exception, e:
+                            logger.error(u"An unknown error occurred trying to parse the feed: %s" % e)
+
+        # attempt to verify that this isn't a substring result
+        # when looking for "Foo - Foo" we don't want "Foobar"
+        # this should be less of an issue when it isn't a self-titled album so we'll only check vs artist
+        #
+        # Also will filter flac & remix albums if not specifically looking for it
+        # This code also checks the ignored words and required words
+
         if len(resultlist):
-            resultlist[:] = [result for result in resultlist if verifyresult(result[0], artistterm, term)]
+            resultlist[:] = [result for result in resultlist if verifyresult(result[0], artistterm, term, losslessOnly)]
         
         if len(resultlist):    
+        
+            # Add a priority if it has any of the preferred words
+            temp_list = []
+            for result in resultlist:
+                if any(word.lower() in result[0].lower() for word in helpers.split_string(headphones.PREFERRED_WORDS)):
+                    temp_list.append((result[0],result[1],result[2],result[3],1))
+                else:
+                    temp_list.append((result[0],result[1],result[2],result[3],0))
+                        
+            resultlist = temp_list
                        
             if headphones.PREFERRED_QUALITY == 2 and headphones.PREFERRED_BITRATE:
 
@@ -437,11 +451,12 @@ def searchNZB(albumid=None, new=False, losslessOnly=False):
                     
                     if not targetsize:
                         logger.info('No track information for %s - %s. Defaulting to highest quality' % (albums[0], albums[1]))
-                        nzblist = sorted(resultlist, key=lambda title: title[1], reverse=True)
+                        nzblist = sorted(resultlist, key=lambda title: (-title[4] , -title[1]))
                     
                     else:
                         logger.info('Target size: %s' % helpers.bytes_to_mb(targetsize))
                         newlist = []
+                        flac_list = []
                         
                         if headphones.PREFERRED_BITRATE_HIGH_BUFFER:
                             high_size_limit = targetsize * int(headphones.PREFERRED_BITRATE_HIGH_BUFFER)/100
@@ -455,28 +470,37 @@ def searchNZB(albumid=None, new=False, losslessOnly=False):
                         for result in resultlist:
                             
                             if high_size_limit and (result[1] > high_size_limit):
-                                logger.info(result[0] + "is too large for this album - not considering it. (Size: " + helpers.bytes_to_mb(result[1]) + ", Maxsize: " + helpers.bytes_to_mb(high_size_limit))
+                                logger.info(result[0] + " is too large for this album - not considering it. (Size: " + helpers.bytes_to_mb(result[1]) + ", Maxsize: " + helpers.bytes_to_mb(high_size_limit))
+                                
+                                # Add lossless nzbs to the "flac list" which we can use if there are no good lossy matches
+                                if 'flac' in result[0].lower():
+                                    flac_list.append((result[0], result[1], result[2], result[3], result[4]))
+                                
                                 continue
                                 
                             if low_size_limit and (result[1] < low_size_limit):
-                                logger.info(result[0] + "is too small for this album - not considering it. (Size: " + helpers.bytes_to_mb(result[1]) + ", Minsize: " + helpers.bytes_to_mb(low_size_limit))
+                                logger.info(result[0] + " is too small for this album - not considering it. (Size: " + helpers.bytes_to_mb(result[1]) + ", Minsize: " + helpers.bytes_to_mb(low_size_limit))
                                 continue
                                                                 
                             delta = abs(targetsize - result[1])
-                            newlist.append((result[0], result[1], result[2], result[3], delta))
+                            newlist.append((result[0], result[1], result[2], result[3], result[4], delta))
             
-                        nzblist = sorted(newlist, key=lambda title: title[4])
+                        nzblist = sorted(newlist, key=lambda title: (-title[4], title[5]))
+                        
+                        if not len(nzblist) and len(flac_list) and headphones.PREFERRED_BITRATE_ALLOW_LOSSLESS:
+                            logger.info("Since there were no appropriate lossy matches (and at least one lossless match), going to use lossless instead")
+                            nzblist = sorted(flac_list, key=lambda title: (-title[4], -title[1]))
                 
                 except Exception, e:
                     
                     logger.debug('Error: %s' % str(e))
                     logger.info('No track information for %s - %s. Defaulting to highest quality' % (albums[0], albums[1]))
                     
-                    nzblist = sorted(resultlist, key=lambda title: title[1], reverse=True)
+                    nzblist = sorted(resultlist, key=lambda title: (-title[4], -title[1]))
             
             else:
             
-                nzblist = sorted(resultlist, key=lambda title: title[1], reverse=True)
+                nzblist = sorted(resultlist, key=lambda title: (-title[4], -title[1]))
             
             
             if new:
@@ -496,6 +520,10 @@ def searchNZB(albumid=None, new=False, losslessOnly=False):
                     else:
                         logger.info('No more results found for %s' % term)
                         return "none"
+                        
+            if not len(nzblist):
+                logger.info('No appropriate matches found for %s' % term)
+                return "none"
 
             logger.info(u"Pre-processing result")
             
@@ -503,13 +531,22 @@ def searchNZB(albumid=None, new=False, losslessOnly=False):
             
             if data and bestqual:
                 logger.info(u'Found best result: <a href="%s">%s</a> - %s' % (bestqual[2], bestqual[0], helpers.bytes_to_mb(bestqual[1])))
-                nzb_folder_name = '%s - %s [%s]' % (helpers.latinToAscii(albums[0]).encode('UTF-8').replace('/', '_'), helpers.latinToAscii(albums[1]).encode('UTF-8').replace('/', '_'), year) 
+                # Get rid of any dodgy chars here so we can prevent sab from renaming our downloads
+                nzb_folder_name = helpers.sab_sanitize_foldername(bestqual[0])
                 if headphones.SAB_HOST and not headphones.BLACKHOLE:
 
                     nzb = classes.NZBDataSearchResult()
                     nzb.extraInfo.append(data)
                     nzb.name = nzb_folder_name
                     sab.sendNZB(nzb)
+                    
+                    # If we sent the file to sab, we can check how it was renamed and insert that into the snatched table
+                    (replace_spaces, replace_dots) = sab.checkConfig()
+
+                    if replace_dots:
+                        nzb_folder_name = helpers.sab_replace_dots(nzb_folder_name)
+                    if replace_spaces:
+                        nzb_folder_name = helpers.sab_replace_spaces(nzb_folder_name)
 
                 elif headphones.BLACKHOLE:
                 
@@ -525,7 +562,7 @@ def searchNZB(albumid=None, new=False, losslessOnly=False):
                         break
                         
                 myDB.action('UPDATE albums SET status = "Snatched" WHERE AlbumID=?', [albums[2]])
-                myDB.action('INSERT INTO snatched VALUES( ?, ?, ?, ?, DATETIME("NOW", "localtime"), ?, ?)', [albums[2], bestqual[0], bestqual[1], bestqual[2], "Snatched", nzb_folder_name])
+                myDB.action('INSERT INTO snatched VALUES( ?, ?, ?, ?, DATETIME("NOW", "localtime"), ?, ?, ?)', [albums[2], bestqual[0], bestqual[1], bestqual[2], "Snatched", nzb_folder_name, "nzb"])
                 return "found"
             else:
                 return "none"
@@ -534,7 +571,7 @@ def searchNZB(albumid=None, new=False, losslessOnly=False):
 
 
 
-def verifyresult(title, artistterm, term):
+def verifyresult(title, artistterm, term, lossless):
     
     title = re.sub('[\.\-\/\_]', ' ', title)
     
@@ -551,6 +588,28 @@ def verifyresult(title, artistterm, term):
     #        return False
 
     #another attempt to weed out substrings. We don't want "Vol III" when we were looking for "Vol II"
+    
+    # Filter out remix search results (if we're not looking for it)
+    if 'remix' not in term.lower() and 'remix' in title.lower():
+        logger.info("Removed " + title + " from results because it's a remix album and we're not looking for a remix album right now")
+        return False
+    
+    # Filter out FLAC if we're not specifically looking for it
+    if headphones.PREFERRED_QUALITY == (0 or '0') and 'flac' in title.lower() and not lossless:
+        logger.info("Removed " + title + " from results because it's a lossless album and we're not looking for a lossless album right now")
+        return False
+        
+    if headphones.IGNORED_WORDS:
+        for each_word in helpers.split_string(headphones.IGNORED_WORDS):
+            if each_word.lower() in title.lower():
+                logger.info("Removed " + title + " from results because it contains ignored word: '" + each_word + "'")
+                return False
+                
+    if headphones.REQUIRED_WORDS:
+        for each_word in helpers.split_string(headphones.REQUIRED_WORDS):
+            if each_word.lower() not in title.lower():
+                logger.info("Removed " + title + " from results because it doesn't contain required word: '" + each_word + "'")
+                return False
     
     tokens = re.split('\W', term, re.IGNORECASE | re.UNICODE)
     for token in tokens:
@@ -589,9 +648,13 @@ def getresultNZB(result):
         except AttributeError:
             logger.warn("AttributeError in getresultNZB.")
     else:
+        request = urllib2.Request(result[2])
+        request.add_header('User-Agent', 'headphones/0.0 +https://github.com/rembo10/headphones')
+        opener = urllib2.build_opener()
+        
         try:
-            nzb = urllib2.urlopen(result[2], timeout=30).read()
-        except urllib2.URLError, e:
+            nzb = opener.open(request).read()
+        except Exception, e:
             logger.warn('Error fetching nzb from url: ' + result[2] + ' %s' % e)
     return nzb
     
@@ -620,8 +683,8 @@ def preprocess(resultlist):
 
                     #TODO: Do we want rar checking in here to try to keep unknowns out?
                     #or at least the option to do so?
-            except ExpatError:
-                logger.error('Unable to parse the best result NZB. Skipping.')
+            except Exception, e:
+                logger.error('Unable to parse the best result NZB. Error: ' + str(e) + '. (Make sure your username/password/API is correct for provider: ' + result[3])
                 continue
             return nzb, result
         else:
@@ -635,9 +698,9 @@ def searchTorrent(albumid=None, new=False, losslessOnly=False):
     myDB = db.DBConnection()
     
     if albumid:
-        results = myDB.select('SELECT ArtistName, AlbumTitle, AlbumID, ReleaseDate from albums WHERE AlbumID=?', [albumid])
+        results = myDB.select('SELECT ArtistName, AlbumTitle, AlbumID, ReleaseDate, SearchTerm from albums WHERE AlbumID=?', [albumid])
     else:
-        results = myDB.select('SELECT ArtistName, AlbumTitle, AlbumID, ReleaseDate from albums WHERE Status="Wanted" OR Status="Wanted Lossless"')
+        results = myDB.select('SELECT ArtistName, AlbumTitle, AlbumID, ReleaseDate, SearchTerm from albums WHERE Status="Wanted" OR Status="Wanted Lossless"')
         new = True
         
     # rutracker login
@@ -663,23 +726,29 @@ def searchTorrent(albumid=None, new=False, losslessOnly=False):
         cleanalbum = helpers.latinToAscii(semi_cleanalbum)
         semi_cleanartist = helpers.replace_all(albums[0], dic)
         cleanartist = helpers.latinToAscii(semi_cleanartist)
-
-        # FLAC usually doesn't have a year for some reason so I'll leave it out
-        # Various Artist albums might be listed as VA, so I'll leave that out too
-        # Only use the year if the term could return a bunch of different albums, i.e. self-titled albums
-        if albums[0] in albums[1] or len(albums[0]) < 4 or len(albums[1]) < 4:
-            term = cleanartist + ' ' + cleanalbum + ' ' + year
-        elif albums[0] == 'Various Artists':
-            term = cleanalbum + ' ' + year
+        
+        # Use provided term if available, otherwise build our own (this code needs to be cleaned up since a lot
+        # of these torrent providers are just using cleanartist/cleanalbum terms
+        if albums[4]:
+            term = albums[4]
+            
         else:
-            term = cleanartist + ' ' + cleanalbum
+            # FLAC usually doesn't have a year for some reason so I'll leave it out
+            # Various Artist albums might be listed as VA, so I'll leave that out too
+            # Only use the year if the term could return a bunch of different albums, i.e. self-titled albums
+            if albums[0] in albums[1] or len(albums[0]) < 4 or len(albums[1]) < 4:
+                term = cleanartist + ' ' + cleanalbum + ' ' + year
+            elif albums[0] == 'Various Artists':
+                term = cleanalbum + ' ' + year
+            else:
+                term = cleanartist + ' ' + cleanalbum
 
-        semi_clean_artist_term = re.sub('[\.\-\/]', ' ', semi_cleanartist).encode('utf-8')
-        semi_clean_album_term = re.sub('[\.\-\/]', ' ', semi_cleanalbum).encode('utf-8')
+        semi_clean_artist_term = re.sub('[\.\-\/]', ' ', semi_cleanartist).encode('utf-8', 'replace')
+        semi_clean_album_term = re.sub('[\.\-\/]', ' ', semi_cleanalbum).encode('utf-8', 'replace')
         # Replace bad characters in the term and unicode it
         term = re.sub('[\.\-\/]', ' ', term).encode('utf-8')
-        artistterm = re.sub('[\.\-\/]', ' ', cleanartist).encode('utf-8')
-        albumterm  = re.sub('[\.\-\/]', ' ', cleanalbum).encode('utf-8')
+        artistterm = re.sub('[\.\-\/]', ' ', cleanartist).encode('utf-8', 'replace')
+        albumterm  = re.sub('[\.\-\/]', ' ', cleanalbum).encode('utf-8', 'replace')
 
         logger.info("Searching torrents for %s since it was marked as wanted" % term)
         
@@ -1085,7 +1154,7 @@ def searchTorrent(albumid=None, new=False, losslessOnly=False):
         #when looking for "Foo - Foo" we don't want "Foobar"
         #this should be less of an issue when it isn't a self-titled album so we'll only check vs artist
         if len(resultlist):
-            resultlist[:] = [result for result in resultlist if verifyresult(result[0], artistterm, term)]
+            resultlist[:] = [result for result in resultlist if verifyresult(result[0], artistterm, term, losslessOnly)]
         
         if len(resultlist):    
                        
@@ -1186,7 +1255,7 @@ def searchTorrent(albumid=None, new=False, losslessOnly=False):
                         break
                         
                 myDB.action('UPDATE albums SET status = "Snatched" WHERE AlbumID=?', [albums[2]])
-                myDB.action('INSERT INTO snatched VALUES( ?, ?, ?, ?, DATETIME("NOW", "localtime"), ?, ?)', [albums[2], bestqual[0], bestqual[1], bestqual[2], "Snatched", torrent_folder_name])
+                myDB.action('INSERT INTO snatched VALUES( ?, ?, ?, ?, DATETIME("NOW", "localtime"), ?, ?, ?)', [albums[2], bestqual[0], bestqual[1], bestqual[2], "Snatched", torrent_folder_name, "torrent"])
 
 def preprocesstorrent(resultlist, pre_sorted_list=False):
     selresult = ""
